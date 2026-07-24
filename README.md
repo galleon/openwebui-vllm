@@ -7,7 +7,7 @@ Ollama is not used.
 | Service | Image | Port | Profile |
 |---|---|---|---|
 | Open WebUI | `ghcr.io/open-webui/open-webui:main` | 3000 | *(always on)* |
-| vLLM | `nvcr.io/nvidia/vllm:26.02-py3` | 8000* | *(always on)* |
+| vLLM | `nvcr.io/nvidia/vllm:26.06-py3` | 8000* | *(always on)* |
 | Guardrails | custom (`python:3.12-slim`, CPU-only) | 8001 | `guardrails` |
 | Embedder | custom (NGC PyTorch 26.01 base) | 7997 | *(always on)* |
 | Docling | custom (NGC PyTorch 26.01 base) | 5001 | *(always on)* |
@@ -37,7 +37,10 @@ Ollama is not used.
 cp .env.example .env
 #    Edit .env — set WEBUI_SECRET_KEY, VLLM_MODEL, and HUGGING_FACE_HUB_TOKEN
 
-# 2. Download the Nemotron reasoning parser (required for all Nemotron-Nano models)
+# 2. Only if you switch VLLM_MODEL to a Nemotron-Nano variant: download its
+#    reasoning parser plugin, and swap docker-compose.yml's vllm command
+#    flags back to the Nemotron ones (see the comment in that file).
+#    Not needed for the default model (Gemma-4-26B-A4B-NVFP4).
 mkdir -p ./vllm_plugins
 wget -O ./vllm_plugins/nano_v3_reasoning_parser.py \
   https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4/resolve/main/nano_v3_reasoning_parser.py
@@ -47,10 +50,10 @@ wget -O ./vllm_plugins/nano_v3_reasoning_parser.py \
 docker compose build docling embedder
 
 # 4. Start everything
-#    vLLM pulls nvcr.io/nvidia/vllm:26.02-py3 then downloads VLLM_MODEL from HF
+#    vLLM pulls nvcr.io/nvidia/vllm:26.06-py3 then downloads VLLM_MODEL from HF
 docker compose up -d
 
-# 5. Open the UI — vLLM models appear automatically once healthy (~15 min for 30B)
+# 5. Open the UI — vLLM models appear automatically once healthy
 open http://localhost:3000
 ```
 
@@ -110,9 +113,18 @@ Guardrails mediates every chat turn once enabled: it runs input rails (prompt-in
 ## GB10 unified memory budget
 
 The GB10 has **128 GB unified memory** shared between CPU and GPU.
-With the default `VLLM_GPU_MEMORY_UTILIZATION=0.55` and Nemotron-3-Nano-30B-NVFP4:
 
-| Component | Memory |
+The table below was measured with the *previous* default model
+(Nemotron-3-Nano-30B-A3B-NVFP4) via `nvidia-smi` on a live stack. The current
+default, **Gemma-4-26B-A4B-NVFP4**, has not been re-measured on this hardware
+yet — its weights are expected to be somewhat smaller (~13-17 GB, based on
+community-reported NVFP4 quantized sizes for the same base model vs. this
+table's measured ~15 GB for Nemotron-30B), but its KV-cache footprint per
+token is **not** directly comparable: Gemma-4 mixes sliding-window and global
+attention layers, while Nemotron-3-Nano does not, so the ~59 GB figure below
+does not transfer. Re-run `nvidia-smi` after deployment and update this table.
+
+| Component | Memory (Nemotron-3-Nano-30B-A3B-NVFP4, previous default) |
 |---|---|
 | vLLM model weights (30B NVFP4) | ~15 GB |
 | vLLM KV cache (fp8, 0.55 utilization) | ~59 GB |
@@ -122,12 +134,12 @@ With the default `VLLM_GPU_MEMORY_UTILIZATION=0.55` and Nemotron-3-Nano-30B-NVFP
 | **Total** | **~87 GB** |
 | **Headroom** | **~41 GB** |
 
-> Figures measured from `nvidia-smi` on a live stack. Docling uses ~9 GB due to
-> EasyOCR loading multiple language model weights — significantly more than the ~3 GB
-> often cited in documentation.
+> Docling uses ~9 GB due to EasyOCR loading multiple language model weights —
+> significantly more than the ~3 GB often cited in documentation. This part
+> of the table is unaffected by the vLLM model choice.
 
 Raise `VLLM_GPU_MEMORY_UTILIZATION` toward `0.70` for longer context windows;
-add the reranker (~2 GB) with `--profile reranker` (reduces headroom to ~39 GB).
+add the reranker (~2 GB) with `--profile reranker`.
 
 Guardrails (`--profile guardrails`) is CPU-only and doesn't consume any of this
 budget — but it does add per-turn *latency*, not memory pressure, from its
@@ -141,7 +153,7 @@ The upstream `michaelfeil/infinity` and `docling-serve-cu128` images target **CU
 
 `Dockerfile.docling` and `Dockerfile.infinity` build on `nvcr.io/nvidia/pytorch:26.01-py3` which ships **CUDA 13.1** with full `sm_121` support.
 
-vLLM uses NVIDIA's official NGC image (`nvcr.io/nvidia/vllm:26.02-py3`) which already includes Blackwell support — no custom build needed.
+vLLM uses NVIDIA's official NGC image (`nvcr.io/nvidia/vllm:26.06-py3`) which already includes Blackwell support — no custom build needed.
 
 `Dockerfile.guardrails` is custom for the opposite reason: it deliberately does **not** build on the NGC PyTorch/CUDA base. NeMo Guardrails does no local inference — it only makes outbound HTTP calls to vLLM's OpenAI-compatible endpoint — so it runs on a plain `python:3.12-slim` base with no GPU reservation.
 
@@ -154,12 +166,29 @@ All tunables live in `.env`. Key ones:
 | Variable | Default | Notes |
 |---|---|---|
 | `WEBUI_SECRET_KEY` | *(must set)* | Change before first run |
-| `VLLM_MODEL` | `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4` | Any HuggingFace model ID |
+| `VLLM_MODEL` | `nvidia/Gemma-4-26B-A4B-NVFP4` | Any HuggingFace model ID — see note below on switching |
 | `VLLM_GPU_MEMORY_UTILIZATION` | `0.55` | See memory budget above |
-| `VLLM_MAX_MODEL_LEN` | `8192` | Context window in tokens |
+| `VLLM_MAX_MODEL_LEN` | `32768` | Context window in tokens; 262144 max |
 | `EMBEDDER_MODEL` | `BAAI/bge-m3` | Any sentence-transformers model |
 | `OMP_NUM_THREADS` | `8` | Grace CPU has 72 Arm cores |
 | `DOCLING_WORKERS` | `2` | Parallel doc extraction workers |
+
+### Switch the inference model
+
+Setting `VLLM_MODEL` in `.env` is enough for most models, but **tool-call and
+reasoning parsers are model-family-specific** and are hardcoded into
+`docker-compose.yml`'s `vllm` `command:` block (`--tool-call-parser` /
+`--reasoning-parser`), not driven by an env var — so switching model
+families requires editing that command too, not just `.env`:
+
+| Model family | Required `command:` flags |
+|---|---|
+| Gemma-4 (default) | `--tool-call-parser gemma4 --reasoning-parser gemma4` *(current default — no change needed)* |
+| Nemotron-Nano | `--tool-call-parser qwen3_coder --reasoning-parser-plugin /vllm_plugins/nano_v3_reasoning_parser.py --reasoning-parser nano_v3` — also requires downloading the plugin file first, see Quick start step 2 |
+
+If you swap to a different model family entirely, check that model's card
+for the vLLM serve flags it expects before assuming either preset above
+applies.
 
 ### Use a reranker (hybrid search)
 
@@ -521,7 +550,7 @@ Fill in the benchmarking section of `.env` (copied from `.env.example`):
 ```env
 OPENWEBUI_API_KEY=<your-api-key>
 OPENWEBUI_KB_ID=<knowledge-base-uuid>
-OPENWEBUI_MODEL=nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4
+OPENWEBUI_MODEL=nvidia/Gemma-4-26B-A4B-NVFP4
 ```
 
 Edit `bench_questions.json` to match your knowledge base content:

@@ -83,8 +83,18 @@ services:
   # Model is loaded from HuggingFace Hub at startup — set VLLM_MODEL in .env.
   # Gated models (Llama, Mistral, …) require HUGGING_FACE_HUB_TOKEN.
   #
-  # Nemotron-Nano models require a custom reasoning parser plugin.
-  # Download it once before starting:
+  # Default model: nvidia/Gemma-4-26B-A4B-NVFP4 (Gemma 4, MoE, 25.2B total /
+  # 3.8B active params, NVIDIA's official NVFP4 quant). Its tool-call and
+  # reasoning parsers are built into vLLM (--tool-call-parser gemma4
+  # --reasoning-parser gemma4 below) — no plugin file needed.
+  # IMPORTANT: this model currently only supports --tensor-parallel-size 1
+  # in vLLM (no expert-parallelism support yet) — do not raise
+  # VLLM_TENSOR_PARALLEL_SIZE for it even on a multi-GPU host.
+  #
+  # Switching to a Nemotron-Nano model instead requires different flags
+  # (a custom reasoning parser plugin, and --tool-call-parser qwen3_coder)
+  # — see the "Switch back to Nemotron-Nano" note in README.md and download
+  # the plugin first:
   #   mkdir -p ./vllm_plugins
   #   wget -O ./vllm_plugins/nano_v3_reasoning_parser.py \
   #     https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4/resolve/main/nano_v3_reasoning_parser.py
@@ -102,7 +112,7 @@ services:
   #   # NIM serves its own OpenAI-compatible /v1 endpoint on the same port
   #   # convention — no other service in this compose file needs to change.
   vllm:
-    image: nvcr.io/nvidia/vllm:${VLLM_NGC_TAG:-26.02-py3}
+    image: nvcr.io/nvidia/vllm:${VLLM_NGC_TAG:-26.06-py3}
     container_name: vllm
     restart: unless-stopped
     # Not published to the host by default. Open WebUI and guardrails reach
@@ -114,11 +124,13 @@ services:
     #   - "${VLLM_PORT:-8000}:8000"
     volumes:
       - ${HF_CACHE_DIR:-./hf_cache}:/root/.cache/huggingface
+      # Only needed if VLLM_MODEL is switched to a Nemotron-Nano variant —
+      # see the header comment above and README.md.
       - ./vllm_plugins:/vllm_plugins:ro
     command:
       - "vllm"
       - "serve"
-      - "${VLLM_MODEL:-nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4}"
+      - "${VLLM_MODEL:-nvidia/Gemma-4-26B-A4B-NVFP4}"
       - "--host"
       - "0.0.0.0"
       - "--port"
@@ -136,14 +148,13 @@ services:
       - "--trust-remote-code"
       - "--enable-auto-tool-choice"
       - "--tool-call-parser"
-      - "qwen3_coder"
-      - "--reasoning-parser-plugin"
-      - "/vllm_plugins/nano_v3_reasoning_parser.py"
+      - "gemma4"
       - "--reasoning-parser"
-      - "nano_v3"
+      - "gemma4"
     environment:
       - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN:-}
-      # FP4 MoE kernel tuning — required for Nemotron-30B-NVFP4; harmless for other models
+      # FP4 MoE kernel tuning — required for NVFP4 MoE models (Gemma-4-26B-A4B,
+      # Nemotron-30B-A3B); harmless for dense models
       - VLLM_USE_FLASHINFER_MOE_FP4=${VLLM_USE_FLASHINFER_MOE_FP4:-1}
       - VLLM_FLASHINFER_MOE_BACKEND=${VLLM_FLASHINFER_MOE_BACKEND:-throughput}
     ipc: host
@@ -199,7 +210,7 @@ services:
       - ./guardrails:/config:ro
     environment:
       - VLLM_BASE_URL=http://vllm:8000/v1
-      - VLLM_MODEL=${VLLM_MODEL:-nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4}
+      - VLLM_MODEL=${VLLM_MODEL:-nvidia/Gemma-4-26B-A4B-NVFP4}
       - OPENAI_API_KEY=${OPENAI_API_KEY:-EMPTY}
       - GUARDRAILS_ALLOWED_TOPICS=${GUARDRAILS_ALLOWED_TOPICS:-general knowledge questions and the uploaded knowledge base}
       - GUARDRAILS_STREAMING_ENABLED=${GUARDRAILS_STREAMING_ENABLED:-true}
