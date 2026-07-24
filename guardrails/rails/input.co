@@ -1,0 +1,91 @@
+# input.co — INPUT CONTROLS (Colang 1.0)
+#
+# Defense in depth: each check below runs a free regex/keyword pre-filter
+# first (catches the obvious/demo-scenario cases with no LLM call), and
+# "self check input" (defined at the bottom) is the slower LLM-based fallback
+# net that catches paraphrased/obfuscated attempts the regexes miss, using
+# the combined prompt defined in config.yml's `prompts:` (task:
+# self_check_input). Topic restriction is folded into that same LLM call
+# rather than given its own flow, to avoid stacking extra sequential vLLM
+# round trips (see README's Guardrails latency caveat).
+#
+# NOTE: exact Colang expression syntax (string methods, control flow) should
+# be validated against the pinned nemoguardrails version during the
+# verification steps in README before relying on this in production —
+# written to the documented Colang 1.0 patterns as of authoring time.
+
+# ── Scenario B target: jailbreak detection ──────────────────────────────────
+define flow check jailbreak
+  $msg = $user_message.lower()
+  $is_jailbreak = False
+
+  if "act as an unrestricted" in $msg
+    $is_jailbreak = True
+  if "ignore your guidelines" in $msg
+    $is_jailbreak = True
+  if "no restrictions" in $msg
+    $is_jailbreak = True
+  if "pretend you have no rules" in $msg
+    $is_jailbreak = True
+  if "dan mode" in $msg
+    $is_jailbreak = True
+  if "developer mode" in $msg
+    $is_jailbreak = True
+  if "jailbreak" in $msg
+    $is_jailbreak = True
+
+  if $is_jailbreak
+    bot refuse to respond
+    stop
+
+# ── Scenario A target: prompt injection detection ───────────────────────────
+define flow check prompt injection
+  $msg = $user_message.lower()
+  $is_injection = False
+
+  if "ignore previous instructions" in $msg
+    $is_injection = True
+  if "ignore all previous instructions" in $msg
+    $is_injection = True
+  if "disregard the above" in $msg
+    $is_injection = True
+  if "disregard previous instructions" in $msg
+    $is_injection = True
+  if "new instructions:" in $msg
+    $is_injection = True
+  if "override your instructions" in $msg
+    $is_injection = True
+
+  if $is_injection
+    bot refuse to respond
+    stop
+
+# ── System prompt protection ─────────────────────────────────────────────────
+define flow protect system prompt
+  $msg = $user_message.lower()
+  $wants_prompt = False
+
+  if "reveal your system prompt" in $msg
+    $wants_prompt = True
+  if "show me your system prompt" in $msg
+    $wants_prompt = True
+  if "repeat your instructions" in $msg
+    $wants_prompt = True
+  if "print your instructions" in $msg
+    $wants_prompt = True
+  if "what are your instructions" in $msg
+    $wants_prompt = True
+  if "reveal your prompt" in $msg
+    $wants_prompt = True
+
+  if $wants_prompt
+    bot refuse to respond
+    stop
+
+# ── LLM-based fallback: jailbreak + injection + system-prompt + topic ───────
+define flow self check input
+  $allowed = execute self_check_input
+
+  if not $allowed
+    bot refuse to respond
+    stop

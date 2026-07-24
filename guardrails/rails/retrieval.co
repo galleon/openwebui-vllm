@@ -1,0 +1,52 @@
+# retrieval.co — RETRIEVAL CONTROLS (Colang 1.0)
+#
+# CAVEAT — read before editing: NeMo Guardrails' native retrieval-rail
+# mechanism (relevant_chunks, retrieve_relevant_chunks action) assumes
+# guardrails itself performs retrieval. In this stack, Open WebUI performs
+# RAG retrieval (via Chroma/Qdrant + the embedder service) and hands
+# guardrails an already context-stuffed prompt — guardrails never sees
+# discrete "chunks" as a first-class object, only the assembled chat
+# message. The flows below are therefore *context-aware approximations*:
+# they pattern-match on Open WebUI's injected context block rather than
+# implementing true chunk-grounded retrieval rails. Confirm the exact
+# context-block delimiter against your Open WebUI version's RAG_TEMPLATE at
+# deployment time (checked here as "<context>", matching the documented
+# default as of authoring time).
+
+# ── Scenario C target: "information not found" short-circuit ────────────────
+# Runs as an INPUT rail (see config.yml) specifically so it can stop before
+# the vLLM generation call when there is effectively nothing to answer from
+# — this is the most reliable version of this check precisely because it
+# doesn't depend on inspecting the LLM's own (possibly hallucinated) output.
+define flow low confidence refusal
+  $has_context_block = "<context>" in $user_message
+  $context_start = $user_message.find("<context>")
+  $context_end = $user_message.find("</context>")
+
+  # Only evaluate emptiness when Open WebUI actually attached a context
+  # block (i.e. RAG was active for this turn / a knowledge base is
+  # attached). Plain chat turns with no KB attached are not subject to this
+  # check — see PLAIN vs RAG task distinction in locustfile.py for the same
+  # convention used by this repo's own benchmarking.
+  if $has_context_block
+    $context_length = $context_end - $context_start
+
+    if $context_length < 40
+      bot inform answer not found in knowledge base
+      stop
+
+# ── Answer only from retrieved content ───────────────────────────────────────
+# Deliberately NOT a separate Colang flow here: a Colang flow that only sets
+# a local variable can't rewrite the outbound prompt or reliably ground the
+# model's answer, and shipping one that looks like it does would be
+# misleading dead code. "Answer only from retrieved content" is instead
+# implemented as the combination of two flows that ARE functional:
+#   1. `low confidence refusal` above — refuses before generation when
+#      there's no context to ground an answer in at all.
+#   2. `self check output` in output.co — its self_check_output prompt
+#      (see config.yml prompts:) explicitly asks the LLM to flag "confident
+#      factual claims that read as fabricated ... rather than being
+#      grounded in information the user actually provided."
+# If stricter grounding is needed later, the correct extension point is a
+# custom action (see actions.py's pattern) that checks bot_message content
+# against the extracted <context> block, analogous to filter_sensitive_info.

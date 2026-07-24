@@ -1,0 +1,39 @@
+# NeMo Guardrails proxy — CPU-only, no GPU/CUDA required.
+#
+# Unlike Dockerfile.docling / Dockerfile.infinity (which build on NGC PyTorch
+# for sm_121 Blackwell GPU support), guardrails does no local inference — it
+# only makes outbound HTTP calls to vLLM's OpenAI-compatible endpoint for
+# generation and self-check rails. Do NOT switch this to the NGC PyTorch base;
+# there is nothing here that benefits from CUDA, and it would needlessly
+# triple the image size and startup time.
+
+FROM python:3.12-slim
+
+# curl: used by the container healthcheck.
+# gettext-base: provides envsubst — config.yml is mounted read-only from the
+#   guardrails/ source directory and templated with ${VLLM_BASE_URL} etc.,
+#   since NeMo Guardrails' config.yml does not natively expand arbitrary
+#   ${VAR} references (only api_key_env_var is a documented env-var hook).
+#   The entrypoint renders the template into a writable runtime dir.
+# gcc/g++: some nemoguardrails transitive deps may need to compile from
+#   source on slim images that lack prebuilt wheels for the current platform.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl \
+        gettext-base \
+        gcc \
+        g++ \
+    && rm -rf /var/lib/apt/lists/*
+
+# Pin to a known-good release; bump deliberately and re-test the demo
+# scenarios in README.md when upgrading.
+RUN pip install --no-cache-dir "nemoguardrails==0.14.1"
+
+COPY docker-entrypoint.guardrails.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
+EXPOSE 8001
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=5 \
+    CMD curl -f http://localhost:8001/v1/health || exit 1
+
+ENTRYPOINT ["docker-entrypoint.sh"]

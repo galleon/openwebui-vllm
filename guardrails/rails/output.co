@@ -1,0 +1,50 @@
+# output.co — OUTPUT CONTROLS (Colang 1.0)
+#
+# NOTE: exact Colang expression syntax should be validated against the
+# pinned nemoguardrails version during the verification steps in README.
+
+# ── General safety / hallucination self-check ────────────────────────────────
+define flow self check output
+  $allowed = execute self_check_output
+
+  if not $allowed
+    bot inform response withheld for safety review
+    stop
+
+# ── Scenario D target: citation enforcement ──────────────────────────────────
+# Open WebUI's RAG prompt template wraps retrieved context in a delimited
+# block before the user's question (see the "context-aware" caveat in
+# retrieval.co — guardrails only sees the assembled prompt text, not
+# discrete chunks). If that context block is present, expect the response to
+# contain at least one citation-like marker; if it's missing, append a
+# disclaimer rather than blocking (lower friction, avoids a second
+# generation call — see the README's Guardrails section for this tradeoff).
+#
+# The exact context-block delimiter below (checked against $user_message)
+# should be confirmed against your Open WebUI version's RAG_TEMPLATE at
+# deployment time — this matches Open WebUI's documented default template
+# as of authoring time, but it is a user-configurable setting upstream.
+define flow enforce citation
+  $has_context = "<context>" in $user_message
+  $has_citation = False
+
+  if "[1]" in $bot_message
+    $has_citation = True
+  if "[2]" in $bot_message
+    $has_citation = True
+  if "source:" in $bot_message.lower()
+    $has_citation = True
+  if "according to" in $bot_message.lower()
+    $has_citation = True
+
+  if $has_context and not $has_citation
+    $bot_message = $bot_message + "\n\n⚠️ Note: this answer could not be fully verified against the retrieved source material."
+
+# ── Sensitive information filtering ───────────────────────────────────────────
+# Regex substitution isn't expressible in pure Colang, so the actual
+# redaction logic lives in actions.py's filter_sensitive_info action.
+define flow filter sensitive info
+  $result = execute filter_sensitive_info
+
+  if $result.found
+    $bot_message = $result.redacted

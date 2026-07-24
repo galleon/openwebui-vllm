@@ -1,0 +1,27 @@
+# policies.co — shared bot message templates (Colang 1.0).
+#
+# Referenced by input.co / output.co / retrieval.co. Kept in one file so the
+# refusal wording is consistent and easy to audit/edit in one place.
+
+define bot refuse to respond
+  "I'm not able to help with that request."
+
+define bot inform cannot help with that topic
+  "That's outside what I'm able to help with here. I can answer questions about: ${GUARDRAILS_ALLOWED_TOPICS}."
+
+define bot inform answer not found in knowledge base
+  "I could not find this information in the approved knowledge base."
+
+define bot inform response withheld for safety review
+  "I generated a response to that, but it didn't pass a safety check, so I'm not able to share it. Could you try rephrasing your question?"
+
+define bot ask to rephrase
+  "I'm not sure how to answer that as asked — could you rephrase it?"
+
+# NOTE: the "unverified" disclaimer used by rails/output.co's "enforce
+# citation" flow is appended via direct $bot_message string concatenation
+# rather than a `bot ...` message template, because `bot <name>` triggers a
+# new/replacement utterance in Colang rather than appending to the response
+# already being validated. Its text lives inline in output.co for that
+# reason — kept out of this shared file to avoid the false impression it's
+# reusable as a `bot` statement.

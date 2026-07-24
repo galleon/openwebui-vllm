@@ -22,8 +22,14 @@ services:
     volumes:
       - open_webui_data:/app/backend/data
     environment:
-      # vLLM as the sole inference backend (OpenAI-compatible)
-      - OPENAI_API_BASE_URL=http://vllm:8000/v1
+      # Inference backend (OpenAI-compatible). Points at vLLM directly by
+      # default. To route chat through NeMo Guardrails instead (recommended
+      # for anything beyond local experimentation — see the "Guardrails"
+      # section in README.md): set OPENAI_API_BASE_URL=http://guardrails:8001/v1
+      # in .env, then `docker compose --profile guardrails up -d guardrails`
+      # and `docker compose restart open-webui` — same toggle pattern as
+      # the reranker/qdrant profiles below.
+      - OPENAI_API_BASE_URL=${OPENAI_API_BASE_URL:-http://vllm:8000/v1}
       - OPENAI_API_KEY=${OPENAI_API_KEY:-EMPTY}
 
       # Docling as the document extraction engine
@@ -82,12 +88,30 @@ services:
   #   mkdir -p ./vllm_plugins
   #   wget -O ./vllm_plugins/nano_v3_reasoning_parser.py \
   #     https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4/resolve/main/nano_v3_reasoning_parser.py
+  # ─── Future option: NVIDIA NIM instead of vLLM (NOT implemented) ────────────
+  # vLLM is not replaced by this change. If GPU headroom allows later, the
+  # command/image below sketch how a NIM microservice could stand in for it
+  # — Open WebUI and (if enabled) guardrails only need an OpenAI-compatible
+  # base_url, so either backend is a drop-in as far as the rest of the stack
+  # is concerned:
+  #
+  # vllm:
+  #   image: nvcr.io/nim/nvidia/<model>:<tag>
+  #   environment:
+  #     - NGC_API_KEY=${NGC_API_KEY:-}
+  #   # NIM serves its own OpenAI-compatible /v1 endpoint on the same port
+  #   # convention — no other service in this compose file needs to change.
   vllm:
     image: nvcr.io/nvidia/vllm:${VLLM_NGC_TAG:-26.02-py3}
     container_name: vllm
     restart: unless-stopped
-    ports:
-      - "${VLLM_PORT:-8000}:8000"
+    # Not published to the host by default. Open WebUI and guardrails reach
+    # vLLM over the internal compose network (http://vllm:8000) regardless
+    # of this mapping — publishing it to the host lets anything with host/
+    # LAN access call vLLM directly, bypassing guardrails entirely. Uncomment
+    # only for direct local debugging, and firewall it if you do.
+    # ports:
+    #   - "${VLLM_PORT:-8000}:8000"
     volumes:
       - ${HF_CACHE_DIR:-./hf_cache}:/root/.cache/huggingface
       - ./vllm_plugins:/vllm_plugins:ro
@@ -139,6 +163,66 @@ services:
       timeout: 10s
       retries: 10
       start_period: 1200s
+
+  # ─── Guardrails (opt-in) ───────────────────────────────────────────────────
+  # NVIDIA NeMo Guardrails, mediating between Open WebUI and vLLM:
+  #   Open WebUI → guardrails → vLLM
+  # CPU-only (see Dockerfile.guardrails) — no GPU reservation needed, doesn't
+  # touch this box's GPU memory budget.
+  #
+  # Off by default. To enable:
+  #   docker compose build guardrails
+  #   docker compose --profile guardrails up -d guardrails
+  #   # then in .env: OPENAI_API_BASE_URL=http://guardrails:8001/v1
+  #   docker compose restart open-webui
+  # See README.md "Guardrails" section for the full walkthrough, the demo
+  # scenarios, and known caveats (streaming/output-rail buffering, added
+  # per-turn latency from self-check LLM calls).
+  #
+  # No depends_on edge from open-webui to this service — same convention as
+  # the reranker/qdrant profiles below: profile-gated services aren't hard
+  # dependencies of the always-on services, startup order is managed
+  # manually per the enable steps above.
+  guardrails:
+    build:
+      context: .
+      dockerfile: Dockerfile.guardrails
+    image: guardrails:latest
+    container_name: guardrails
+    restart: unless-stopped
+    profiles: [guardrails]
+    ports:
+      - "${GUARDRAILS_PORT:-8001}:8001"
+    volumes:
+      # Read-only: config is source-controlled, not runtime state. The
+      # entrypoint renders it into a writable /tmp dir inside the container.
+      - ./guardrails:/config:ro
+    environment:
+      - VLLM_BASE_URL=http://vllm:8000/v1
+      - VLLM_MODEL=${VLLM_MODEL:-nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-EMPTY}
+      - GUARDRAILS_ALLOWED_TOPICS=${GUARDRAILS_ALLOWED_TOPICS:-general knowledge questions and the uploaded knowledge base}
+      - GUARDRAILS_STREAMING_ENABLED=${GUARDRAILS_STREAMING_ENABLED:-true}
+      - GUARDRAILS_LOG_LEVEL=${GUARDRAILS_LOG_LEVEL:-info}
+    depends_on:
+      vllm:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/v1/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    logging:
+      # New service in the request path handling untrusted input — capped
+      # rotation so its logs (useful for auditing blocked/flagged turns)
+      # don't grow unbounded. Not applied to the other services here to
+      # keep this diff scoped; consider a repo-wide x-logging anchor as a
+      # separate follow-up if you want the same rotation everywhere.
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   # ─── Embedder ────────────────────────────────────────────────────────────────
   # GPU embedding server (Infinity) — replaces Ollama's embedding function.
