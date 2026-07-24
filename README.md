@@ -92,7 +92,7 @@ Docling UI (for testing document extraction): http://localhost:5001/ui
     Guardrails API        Embedder API    Docling API
       :8001/v1              :7997/v1         :5001
            │                   │              │
-   ┌───────┴──────────┐  ┌─────┴──────┐ ┌───┴────────────┐
+   ┌───────┴──────────┐  ┌─────┴──────┐ ┌─────┴──────────┐
    │  NeMo Guardrails │  │  Infinity  │ │    Docling     │
    │  (CPU, no GPU)   │  └────────────┘ └────────────────┘
    │ input/output/    │       GPU            GPU
