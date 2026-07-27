@@ -140,17 +140,21 @@ services:
       - "--max-model-len"
       - "${VLLM_MAX_MODEL_LEN:-32768}"
       - "--gpu-memory-utilization"
-      - "${VLLM_GPU_MEMORY_UTILIZATION:-0.55}"
+      - "${VLLM_GPU_MEMORY_UTILIZATION:-0.70}"
       - "--max-num-seqs"
       - "${VLLM_MAX_NUM_SEQS:-8}"
       - "--kv-cache-dtype"
       - "${VLLM_KV_CACHE_DTYPE:-fp8}"
+      - "--quantization"
+      - "${VLLM_QUANTIZATION:-modelopt}"
       - "--trust-remote-code"
       - "--enable-auto-tool-choice"
       - "--tool-call-parser"
-      - "gemma4"
+      - "${VLLM_TOOL_CALL_PARSER:-gemma4}"
+      - "--reasoning-parser-plugin"
+      - "${VLLM_REASONING_PARSER_PLUGIN:-/vllm_plugins/noop.py}"
       - "--reasoning-parser"
-      - "gemma4"
+      - "${VLLM_REASONING_PARSER:-gemma4}"
     environment:
       - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN:-}
       # FP4 MoE kernel tuning — required for NVFP4 MoE models (Gemma-4-26B-A4B,
@@ -169,7 +173,7 @@ services:
               count: all
               capabilities: [gpu]
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:8000/v1/models"]
       interval: 30s
       timeout: 10s
       retries: 10
@@ -219,7 +223,7 @@ services:
       vllm:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8001/v1/health"]
+      test: ["CMD-SHELL", "bash -c '>/dev/tcp/localhost/8001'"]
       interval: 30s
       timeout: 10s
       retries: 5
@@ -392,7 +396,8 @@ services:
     volumes:
       - qdrant_data:/qdrant/storage
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:6333/healthz"]
+      # qdrant:latest has no curl — use bash /dev/tcp to check REST port
+      test: ["CMD-SHELL", "bash -c '>/dev/tcp/localhost/6333'"]
       interval: 30s
       timeout: 10s
       retries: 5

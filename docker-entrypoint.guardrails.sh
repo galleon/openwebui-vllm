@@ -1,11 +1,12 @@
-#!/bin/sh
+#!/bin/bash
 # Renders the read-only mounted guardrails/ config (bind-mounted at /config)
 # into a writable runtime directory, substituting the env vars NeMo
 # Guardrails' config.yml does not expand natively, then execs the server.
 set -eu
 
 SRC_DIR=/config
-RUNTIME_DIR=/tmp/guardrails-config
+CONFIGS_DIR=/tmp/guardrails-config
+RUNTIME_DIR="$CONFIGS_DIR/default"
 
 mkdir -p "$RUNTIME_DIR/rails"
 
@@ -31,8 +32,28 @@ if [ "${GUARDRAILS_LOG_LEVEL:-info}" = "debug" ]; then
     VERBOSE_FLAG="--verbose"
 fi
 
-exec nemoguardrails server \
-    --config="$RUNTIME_DIR" \
-    --port 8001 \
+# Start nemoguardrails on the internal port (8002).
+# The proxy (port 8001, below) routes /v1/models to vLLM and everything else
+# here — Open WebUI only sees the proxy, which makes models discoverable even
+# though nemoguardrails has no /v1/models endpoint of its own.
+nemoguardrails server \
+    --config="$CONFIGS_DIR" \
+    --port 8002 \
     --default-config-id default \
-    $VERBOSE_FLAG
+    $VERBOSE_FLAG &
+RAILS_PID=$!
+
+# Wait for nemoguardrails to open its port before accepting proxy traffic.
+echo "[entrypoint] waiting for nemoguardrails on port 8002 ..."
+until bash -c '>/dev/tcp/localhost/8002' 2>/dev/null; do sleep 1; done
+echo "[entrypoint] nemoguardrails ready, starting proxy on port 8001"
+
+# Run the proxy in the foreground as the container's main process.
+# If either process dies, the shell (PID 1) catches the exit via wait -n.
+python3 /config/proxy.py &
+PROXY_PID=$!
+
+wait -n $RAILS_PID $PROXY_PID
+echo "[entrypoint] a child process exited — shutting down"
+kill $RAILS_PID $PROXY_PID 2>/dev/null
+wait
