@@ -167,6 +167,11 @@ All tunables live in `.env`. Key ones:
 |---|---|---|
 | `WEBUI_SECRET_KEY` | *(must set)* | Change before first run |
 | `VLLM_MODEL` | `nvidia/Gemma-4-26B-A4B-NVFP4` | Any HuggingFace model ID — see note below on switching |
+| `VLLM_QUANTIZATION` | `modelopt` | Required for NVFP4 models; leave as `modelopt` for all supported models |
+| `VLLM_TOOL_CALL_PARSER` | `gemma4` | `qwen3_coder` for Nemotron-Nano |
+| `VLLM_REASONING_PARSER` | `gemma4` | `nano_v3` for Nemotron-Nano |
+| `VLLM_REASONING_PARSER_PLUGIN` | `/vllm_plugins/noop.py` | Path to reasoning parser plugin; override for Nemotron-Nano |
+| `VLLM_USE_FLASHINFER_MOE_FP4` | `0` | Set to `1` for Nemotron-Nano / Qwen NVFP4; must be `0` for Gemma-4 (GELU_TANH activation incompatible with FlashInfer backends) |
 | `VLLM_GPU_MEMORY_UTILIZATION` | `0.55` | See memory budget above |
 | `VLLM_MAX_MODEL_LEN` | `32768` | Context window in tokens; 262144 max |
 | `EMBEDDER_MODEL` | `BAAI/bge-m3` | Any sentence-transformers model |
@@ -175,20 +180,24 @@ All tunables live in `.env`. Key ones:
 
 ### Switch the inference model
 
-Setting `VLLM_MODEL` in `.env` is enough for most models, but **tool-call and
-reasoning parsers are model-family-specific** and are hardcoded into
-`docker-compose.yml`'s `vllm` `command:` block (`--tool-call-parser` /
-`--reasoning-parser`), not driven by an env var — so switching model
-families requires editing that command too, not just `.env`:
+All model-switching is done entirely via `.env` — no editing `docker-compose.yml` needed.
+The parser and quantization flags are all env-var driven:
 
-| Model family | Required `command:` flags |
+| Model family | `.env` settings |
 |---|---|
-| Gemma-4 (default) | `--tool-call-parser gemma4 --reasoning-parser gemma4` *(current default — no change needed)* |
-| Nemotron-Nano | `--tool-call-parser qwen3_coder --reasoning-parser-plugin /vllm_plugins/nano_v3_reasoning_parser.py --reasoning-parser nano_v3` — also requires downloading the plugin file first, see Quick start step 2 |
+| **Gemma-4 NVFP4** (default) | `VLLM_MODEL=nvidia/Gemma-4-26B-A4B-NVFP4`<br>`VLLM_QUANTIZATION=modelopt`<br>`VLLM_TOOL_CALL_PARSER=gemma4`<br>`VLLM_REASONING_PARSER=gemma4`<br>`VLLM_REASONING_PARSER_PLUGIN=/vllm_plugins/noop.py`<br>`VLLM_USE_FLASHINFER_MOE_FP4=0` |
+| **Nemotron-3-Nano NVFP4** | `VLLM_MODEL=nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4`<br>`VLLM_QUANTIZATION=modelopt`<br>`VLLM_TOOL_CALL_PARSER=qwen3_coder`<br>`VLLM_REASONING_PARSER=nano_v3`<br>`VLLM_REASONING_PARSER_PLUGIN=/vllm_plugins/nano_v3_reasoning_parser.py`<br>`VLLM_USE_FLASHINFER_MOE_FP4=1` |
 
-If you swap to a different model family entirely, check that model's card
-for the vLLM serve flags it expects before assuming either preset above
-applies.
+Nemotron-Nano also requires downloading its reasoning parser plugin first (see Quick start step 2).
+
+After changing `.env`, restart vLLM to load the new model:
+```bash
+docker compose up -d vllm
+docker compose restart open-webui   # picks up new OPENWEBUI_MODEL
+```
+
+If you swap to a different model family entirely, check that model's HuggingFace card
+for the vLLM serve flags it expects before assuming either preset above applies.
 
 ### Use a reranker (hybrid search)
 
@@ -259,12 +268,15 @@ docling:
 guardrails/
 ├── config.yml          # models, rail activation, prompts
 ├── actions.py           # custom action: regex-based sensitive-info redaction
+├── proxy.py             # thin stdlib HTTP proxy (see note below)
 └── rails/
     ├── policies.co       # shared refusal / "not found" message templates
     ├── input.co           # jailbreak / prompt-injection / system-prompt / topic checks
     ├── output.co           # safety self-check, citation enforcement, sensitive-info filtering
     └── retrieval.co         # context-grounding short-circuit ("not found" refusal)
 ```
+
+The guardrails container runs two processes: **nemoguardrails** (port 8002, internal) and a **thin proxy** (port 8001, external). The proxy routes `GET /v1/models` directly to vLLM so Open WebUI can discover models, while all chat traffic goes through nemoguardrails. It also rewrites NeMo's blocked-response format (`{"messages":[…]}`) to the OpenAI-compatible format (`{"choices":[…]}`) that Open WebUI expects.
 
 ### What each guardrail does, and why
 

@@ -11,7 +11,7 @@
 #   ${VLLM_BASE_URL}              e.g. http://vllm:8000/v1
 #   ${VLLM_MODEL}                 e.g. nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4
 #   ${GUARDRAILS_ALLOWED_TOPICS}  free-text topic description, see .env.example
-#   ${GUARDRAILS_STREAMING_ENABLED}  "true" or "false"
+#   ${GUARDRAILS_STREAMING_ENABLED}  true or false (boolean — not quoted)
 
 models:
   - type: main
@@ -69,12 +69,7 @@ rails:
       - enforce citation
       - filter sensitive info
 
-streaming:
-  enabled: ${GUARDRAILS_STREAMING_ENABLED}
-  # Output rails that need the full response (self check output, enforce
-  # citation) structurally cannot validate a partial stream — expect
-  # response buffering on any turn where those rails fire, independent of
-  # this flag. See README's "Guardrails" section for the full caveat.
+streaming: ${GUARDRAILS_STREAMING_ENABLED}
 
 prompts:
   - task: self_check_input

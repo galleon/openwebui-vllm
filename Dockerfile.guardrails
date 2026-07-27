@@ -26,7 +26,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Pin to a known-good release; bump deliberately and re-test the demo
 # scenarios in README.md when upgrading.
-RUN pip install --no-cache-dir "nemoguardrails==0.14.1"
+RUN pip install --no-cache-dir "nemoguardrails==0.14.1" "langchain-openai"
 
 COPY docker-entrypoint.guardrails.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
@@ -34,6 +34,6 @@ RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 EXPOSE 8001
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=5 \
-    CMD curl -f http://localhost:8001/v1/health || exit 1
+    CMD bash -c '>/dev/tcp/localhost/8001' || exit 1
 
 ENTRYPOINT ["docker-entrypoint.sh"]
