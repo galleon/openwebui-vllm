@@ -6,10 +6,17 @@ Routes:
   GET  /v1/models  -> vLLM directly  (model discovery — guardrails has no /v1/models)
   *    /*          -> nemoguardrails  (all chat traffic stays guarded)
 
-Also rewrites NeMo Guardrails' blocked-response format:
-  {"messages": [{"role": "assistant", "content": "..."}]}
-to the OpenAI-compatible format Open WebUI expects:
-  {"choices": [{"message": {"role": "assistant", "content": "..."}, ...}]}
+NeMo Guardrails uses its own SSE and JSON formats that differ from OpenAI's:
+  - Streaming SSE: data: {"messages":[{"role":"...", "content":"..."}]}
+  - Blocked JSON:  {"messages":[{"role":"assistant","content":"..."}]}
+
+This proxy rewrites both to the OpenAI-compatible format Open WebUI expects:
+  - Streaming SSE: data: {"id":"...","object":"chat.completion.chunk","choices":[{"delta":{...}}]}
+  - Non-streaming:  {"choices":[{"message":{...},"finish_reason":"stop"}],...}
+
+Additionally: when the client requested a streaming response (stream:true in the
+request body) but nemoguardrails returned a non-streaming JSON (e.g. for blocked
+messages), the proxy wraps the JSON in SSE so locust TTFT/ITL/TPS metrics fire.
 
 Runs on port 8001 (external). Nemoguardrails runs on port 8002 (internal).
 Pure stdlib — no extra packages needed.
@@ -30,8 +37,10 @@ RAILS_PORT = 8002
 LISTEN_PORT = 8001
 
 
+# ── Format rewriters ──────────────────────────────────────────────────────────
+
 def _to_openai(body: bytes, model: str) -> bytes | None:
-    """If body is NeMo's {messages:[...]} format, rewrite to OpenAI choices format."""
+    """Rewrite NeMo's {messages:[...]} non-streaming format to OpenAI choices format."""
     try:
         d = json.loads(body)
         if "messages" in d and "choices" not in d:
@@ -49,11 +58,71 @@ def _to_openai(body: bytes, model: str) -> bytes | None:
     return None
 
 
+def _rewrite_sse_line(line: bytes, model: str, chunk_id: str) -> bytes:
+    """Rewrite a single SSE data line from NeMo format to OpenAI chunk format.
+
+    NeMo sends:  data: {"messages":[{"role":"assistant","content":"..."}]}
+    We produce:  data: {"id":"...","object":"chat.completion.chunk","choices":[{"delta":{...}}]}
+    """
+    if not line.startswith(b"data: "):
+        return line
+    payload = line[6:].strip()
+    if payload == b"[DONE]" or not payload:
+        return line
+    try:
+        d = json.loads(payload)
+    except json.JSONDecodeError:
+        return line
+    if "messages" in d and "choices" not in d:
+        last = d["messages"][-1]
+        rewritten = {
+            "id": chunk_id,
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [{"index": 0, "delta": last, "finish_reason": "stop"}],
+        }
+        return b"data: " + json.dumps(rewritten).encode()
+    return line
+
+
+def _json_to_sse(body: bytes, model: str) -> bytes:
+    """Wrap a non-streaming (possibly NeMo-format) JSON body in SSE format.
+
+    Used when the client requested stream:true but the backend returned JSON.
+    Produces a minimal two-event SSE stream: one data chunk then [DONE].
+    """
+    rewritten = _to_openai(body, model)
+    try:
+        full = json.loads(rewritten or body)
+        msg = full.get("choices", [{}])[0].get("message") or {}
+        chunk = {
+            "id": full.get("id") or f"chatcmpl-{uuid.uuid4().hex[:8]}",
+            "object": "chat.completion.chunk",
+            "created": full.get("created") or int(time.time()),
+            "model": full.get("model") or model,
+            "choices": [{"index": 0, "delta": msg, "finish_reason": "stop"}],
+        }
+        payload = json.dumps(chunk).encode()
+    except Exception:
+        payload = rewritten or body
+    return b"data: " + payload + b"\n\ndata: [DONE]\n\n"
+
+
+# ── Proxy handler ─────────────────────────────────────────────────────────────
+
 class _Proxy(http.server.BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):  # noqa: D102
         pass  # keep logs quiet; nemoguardrails already logs requests
 
-    def _forward(self, host: str, port: int, path: str, rewrite_model: str | None = None) -> None:
+    def _forward(
+        self,
+        host: str,
+        port: int,
+        path: str,
+        rewrite_model: str | None = None,
+        stream_requested: bool = False,
+    ) -> None:
         body_len = int(self.headers.get("Content-Length", 0) or 0)
         body = self.rfile.read(body_len) if body_len else None
         fwd_headers = {
@@ -72,19 +141,70 @@ class _Proxy(http.server.BaseHTTPRequestHandler):
         is_json = "application/json" in ct
         is_stream = "text/event-stream" in ct
 
-        if rewrite_model and is_json and not is_stream:
-            # Read full body so we can inspect and potentially rewrite it.
-            raw = resp.read()
-            rewritten = _to_openai(raw, rewrite_model)
-            out = rewritten if rewritten is not None else raw
+        if rewrite_model and is_stream:
+            # ── Streaming: rewrite NeMo SSE events to OpenAI chunk format ────
+            chunk_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
             self.send_response(resp.status)
             for k, v in resp.getheaders():
-                if k.lower() not in ("transfer-encoding", "connection", "content-length"):
+                if k.lower() not in ("transfer-encoding", "connection"):
                     self.send_header(k, v)
-            self.send_header("Content-Length", str(len(out)))
             self.end_headers()
-            self.wfile.write(out)
+            buf = b""
+            try:
+                while True:
+                    data = resp.read(4096)
+                    if not data:
+                        break
+                    buf += data
+                    # Flush complete newline-terminated SSE lines immediately.
+                    while b"\n" in buf:
+                        line, buf = buf.split(b"\n", 1)
+                        out = _rewrite_sse_line(line, rewrite_model, chunk_id)
+                        self.wfile.write(out + b"\n")
+                    self.wfile.flush()
+                if buf:
+                    out = _rewrite_sse_line(buf, rewrite_model, chunk_id)
+                    self.wfile.write(out)
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            finally:
+                conn.close()
+
+        elif rewrite_model and is_json and not is_stream:
+            # ── Non-streaming JSON from nemoguardrails ──────────────────────
+            raw = resp.read()
+            conn.close()
+            if stream_requested:
+                # Client wanted SSE but backend returned JSON (common for blocked
+                # messages when streaming is disabled at the guardrails config
+                # level).  Wrap in SSE so locust can fire TTFT/TPS metrics.
+                out = _json_to_sse(raw, rewrite_model)
+                self.send_response(200)
+                for k, v in resp.getheaders():
+                    if k.lower() not in (
+                        "transfer-encoding", "connection",
+                        "content-type", "content-length",
+                    ):
+                        self.send_header(k, v)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Content-Length", str(len(out)))
+                self.end_headers()
+                self.wfile.write(out)
+            else:
+                rewritten = _to_openai(raw, rewrite_model)
+                out = rewritten if rewritten is not None else raw
+                self.send_response(resp.status)
+                for k, v in resp.getheaders():
+                    if k.lower() not in ("transfer-encoding", "connection", "content-length"):
+                        self.send_header(k, v)
+                self.send_header("Content-Length", str(len(out)))
+                self.end_headers()
+                self.wfile.write(out)
+
         else:
+            # ── Pass-through (GET /v1/models → vLLM, or unknown format) ─────
             self.send_response(resp.status)
             for k, v in resp.getheaders():
                 if k.lower() not in ("transfer-encoding", "connection"):
@@ -107,13 +227,16 @@ class _Proxy(http.server.BaseHTTPRequestHandler):
             self._forward(VLLM_HOST, VLLM_PORT, "/v1/models")
             return
 
-        # Extract model name from request body for potential response rewriting.
+        # Extract model name and stream flag from the request body.
         model = ""
+        stream_requested = False
         body_len = int(self.headers.get("Content-Length", 0) or 0)
         if body_len and self.path.startswith("/v1/chat"):
             raw = self.rfile.read(body_len)
             try:
-                model = json.loads(raw).get("model", "")
+                parsed = json.loads(raw)
+                model = parsed.get("model", "")
+                stream_requested = bool(parsed.get("stream", False))
             except Exception:
                 pass
             # Reconstruct rfile so _forward can re-read the body.
@@ -121,7 +244,11 @@ class _Proxy(http.server.BaseHTTPRequestHandler):
             self.rfile = io.BytesIO(raw)
             self.headers["Content-Length"] = str(body_len)
 
-        self._forward(RAILS_HOST, RAILS_PORT, self.path, rewrite_model=model or None)
+        self._forward(
+            RAILS_HOST, RAILS_PORT, self.path,
+            rewrite_model=model or None,
+            stream_requested=stream_requested,
+        )
 
     def do_GET(self):    self._route()  # noqa: E704
     def do_POST(self):   self._route()  # noqa: E704

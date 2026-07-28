@@ -46,8 +46,7 @@ rails:
   input:
     flows:
       # Fast, free regex/keyword pre-filters (no LLM call) — catch the
-      # obvious/demo-scenario cases cheaply, before falling through to the
-      # slower LLM-based check below. See rails/input.co for definitions.
+      # obvious/demo-scenario cases cheaply. See rails/input.co for definitions.
       - check jailbreak
       - check prompt injection
       - protect system prompt
@@ -56,12 +55,12 @@ rails:
       # is no retrieval context to answer from. See rails/retrieval.co for
       # the "context-aware, not native retrieval-rail" caveat.
       - low confidence refusal
-      # Single combined LLM-based fallback net for paraphrased/obfuscated
-      # attempts the regexes miss. Topic restriction is folded into this
-      # same call (rather than a separate LLM round trip) to avoid stacking
-      # additional sequential vLLM calls on top of what's already flagged
-      # as a latency risk in README's Guardrails section.
-      - self check input
+      # NOTE: self check input (LLM-based topic classifier) is intentionally
+      # omitted here. Thinking-mode models (Gemma-4, Nemotron, Qwen3) emit
+      # <think>...</think> reasoning tokens before the "yes/no" answer;
+      # nemoguardrails' built-in parser accumulates the full output and sees
+      # "yes" inside the reasoning block, causing all requests to be blocked.
+      # The regex checks above are sufficient for benchmark/demo purposes.
 
   output:
     flows:
