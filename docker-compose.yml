@@ -145,6 +145,7 @@ services:
       - "${VLLM_MAX_NUM_SEQS:-8}"
       - "--kv-cache-dtype"
       - "${VLLM_KV_CACHE_DTYPE:-fp8}"
+      - "--no-enable-prefix-caching"
       - "--quantization"
       - "${VLLM_QUANTIZATION:-modelopt}"
       - "--trust-remote-code"
