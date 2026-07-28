@@ -2,13 +2,21 @@
 # Full benchmark sweep — supports multiple hardware targets.
 # Usage: bash run_sweep.sh [TARGET [PHASE]]
 #   TARGET: dgx-spark-gb10 (default) | rtx-pro-6000 | l40s
-#   PHASE:  all (default) | nemotron | qwen
+#   PHASE:  all (default) | gemma4 | nemotron | qwen
+#
+# For each model phase, two sub-sweeps are run back-to-back:
+#   1. Without guardrails  (Open WebUI → vLLM direct)
+#   2. With guardrails     (Open WebUI → guardrails proxy → nemoguardrails → vLLM)
+#
+# Results land in results/<TARGET>/<model>/   and   results/<TARGET>/<model>-rails/
 #
 # Prerequisites:
 #   - .env already configured for the target hardware (cp .env.<TARGET>.* .env)
 #   - OPENWEBUI_API_KEY and OPENWEBUI_KB_ID set in .env
 #   - vLLM container healthy before running
 #   - uv installed
+#   - For guardrails sub-sweeps: guardrails image already built
+#       docker compose build guardrails
 
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -19,13 +27,15 @@ PHASE=${2:-all}
 case "$TARGET" in
   dgx-spark-gb10)
     GPU_MEM=0.70
+    GEMMA4_MAX_LEN=8192
     NEMOTRON_MAX_LEN=8192
-    QWEN_MAX_LEN=32768   # raised from 8192 — Qwen3.5 think chains overflow at 8192
+    QWEN_MAX_LEN=32768   # Qwen3.5 think chains overflow at 8192
     USER_LADDER=(10 20 30 50 100)
     RAMP_LADDER=(2  2  5  5  10)
     ;;
   rtx-pro-6000)
     GPU_MEM=0.55
+    GEMMA4_MAX_LEN=16384
     NEMOTRON_MAX_LEN=16384
     QWEN_MAX_LEN=16384
     USER_LADDER=(10 20 30 50 100)
@@ -33,6 +43,7 @@ case "$TARGET" in
     ;;
   l40s)
     GPU_MEM=0.90
+    GEMMA4_MAX_LEN=8192
     NEMOTRON_MAX_LEN=8192
     QWEN_MAX_LEN=8192    # KV budget ~8 GB on L40S — keep context short
     USER_LADDER=(5 10 15 20 30)
@@ -50,6 +61,16 @@ LOCUST="./locustfile.py"
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
+# Safe upsert: update key if present, append if missing.
+upsert_env() {
+    local key=$1 val=$2
+    if grep -q "^${key}=" .env; then
+        sed -i "s|^${key}=.*|${key}=${val}|" .env
+    else
+        echo "${key}=${val}" >> .env
+    fi
+}
+
 wait_healthy() {
     local svc=${1:-vllm}
     echo "[sweep] waiting for $svc to be healthy..."
@@ -60,10 +81,6 @@ wait_healthy() {
 }
 
 smoke_test() {
-    # One-shot check: send a minimal completion through the full stack.
-    # Model readiness is already guaranteed by wait_healthy (healthcheck hits
-    # /v1/models, not just /health).  This catches config problems like a wrong
-    # model name or a missing API key before wasting benchmark time.
     local model api_key http_code
     model=$(grep '^OPENWEBUI_MODEL=' .env | cut -d= -f2)
     api_key=$(grep '^OPENWEBUI_API_KEY=' .env | cut -d= -f2)
@@ -82,11 +99,9 @@ smoke_test() {
 }
 
 warmup() {
-    # Send two full-length requests (no max_tokens cap) to trigger any lazy
-    # kernel compilation before benchmark starts.  Critical for FP4 models:
-    # FlashInfer FP4 MoE profiling runs on the first real batch and can block
-    # generation for several minutes — without warmup, all locust requests stay
-    # in-flight for the entire 5-minute window and are never recorded.
+    # Two full-length requests trigger any lazy kernel compilation (critical for
+    # FP4 models: FlashInfer FP4 MoE profiling on the first real batch can block
+    # generation for several minutes without this).
     local model api_key http_code i
     model=$(grep '^OPENWEBUI_MODEL=' .env | cut -d= -f2)
     api_key=$(grep '^OPENWEBUI_API_KEY=' .env | cut -d= -f2)
@@ -107,7 +122,6 @@ warmup() {
 run_locust() {
     local tag=$1 users=$2 ramp=$3 outdir=$4
     local prefix="${tag}_u${users}"
-    # mixed = no tag filter (all four tasks); nothink/think = filtered
     local tag_args=(); [[ "$tag" != "mixed" ]] && tag_args=(-T "$tag")
     echo "[sweep] $(date '+%H:%M:%S') ▶ $prefix (tag=$tag, users=$users)"
     uv run "$LOCUST" --host "$HOST" \
@@ -127,73 +141,152 @@ sweep() {
     done
 }
 
+# switch_model: update .env, restart vLLM + Open WebUI, smoke-test, warmup.
+# Args: model tool_call_parser parser_plugin parser fp4 fp4_backend max_len
 switch_model() {
-    local model=$1 parser_plugin=$2 parser=$3 fp4=$4 max_len=$5
+    local model=$1 tool_call_parser=$2 parser_plugin=$3 parser=$4 \
+          fp4=$5 fp4_backend=$6 max_len=$7
     echo "[sweep] switching vLLM to $model (MAX_MODEL_LEN=$max_len)"
-    echo "[sweep] NOTE: vLLM must unload the current model and load the new one."
-    echo "[sweep]       This typically takes 10–20 min (download + warm-up). Do not interrupt."
-    sed -i "s|^VLLM_MODEL=.*|VLLM_MODEL=$model|"                                             .env
-    sed -i "s|^OPENWEBUI_MODEL=.*|OPENWEBUI_MODEL=$model|"                                   .env
-    sed -i "s|^VLLM_REASONING_PARSER_PLUGIN=.*|VLLM_REASONING_PARSER_PLUGIN=$parser_plugin|" .env
-    sed -i "s|^VLLM_REASONING_PARSER=.*|VLLM_REASONING_PARSER=$parser|"                      .env
-    sed -i "s|^VLLM_USE_FLASHINFER_MOE_FP4=.*|VLLM_USE_FLASHINFER_MOE_FP4=$fp4|"            .env
-    sed -i "s|^VLLM_GPU_MEMORY_UTILIZATION=.*|VLLM_GPU_MEMORY_UTILIZATION=$GPU_MEM|"         .env
-    sed -i "s|^VLLM_MAX_MODEL_LEN=.*|VLLM_MAX_MODEL_LEN=$max_len|"                           .env
-    sed -i "s|^VLLM_KV_CACHE_DTYPE=.*|VLLM_KV_CACHE_DTYPE=fp8|"                             .env
+    upsert_env VLLM_MODEL                  "$model"
+    upsert_env OPENWEBUI_MODEL             "$model"
+    upsert_env VLLM_TOOL_CALL_PARSER       "$tool_call_parser"
+    upsert_env VLLM_REASONING_PARSER_PLUGIN "$parser_plugin"
+    upsert_env VLLM_REASONING_PARSER       "$parser"
+    upsert_env VLLM_USE_FLASHINFER_MOE_FP4 "$fp4"
+    upsert_env VLLM_FLASHINFER_MOE_BACKEND "$fp4_backend"
+    upsert_env VLLM_GPU_MEMORY_UTILIZATION "$GPU_MEM"
+    upsert_env VLLM_MAX_MODEL_LEN          "$max_len"
+    upsert_env VLLM_KV_CACHE_DTYPE         fp8
     docker compose up -d vllm
     wait_healthy vllm
-    echo "[sweep] restarting open-webui so it picks up the new model"
-    docker compose restart open-webui
+    docker compose up -d open-webui
     wait_healthy open-webui
     smoke_test
     warmup
 }
 
-# ── Phase 1: Nemotron ─────────────────────────────────────────────────────────
+ensure_qdrant() {
+    if ! docker inspect qdrant --format='{{.State.Status}}' 2>/dev/null | grep -q running; then
+        echo "[sweep] starting Qdrant ..."
+        docker compose --profile qdrant up -d qdrant
+        until [ "$(docker inspect --format='{{.State.Health.Status}}' qdrant 2>/dev/null)" = "healthy" ]; do
+            sleep 5
+        done
+        echo "[sweep] Qdrant healthy"
+    fi
+}
+
+enable_guardrails() {
+    echo "[sweep] enabling guardrails (Open WebUI → guardrails:8001 → vLLM)"
+    upsert_env OPENAI_API_BASE_URL "http://guardrails:8001/v1"
+    # Recreate guardrails so it picks up the current VLLM_MODEL from .env
+    docker compose --profile guardrails up -d guardrails
+    wait_healthy guardrails
+    docker compose up -d open-webui
+    wait_healthy open-webui
+    smoke_test
+}
+
+disable_guardrails() {
+    echo "[sweep] disabling guardrails (Open WebUI → vLLM direct)"
+    upsert_env OPENAI_API_BASE_URL "http://vllm:8000/v1"
+    docker compose --profile guardrails stop guardrails 2>/dev/null || true
+    docker compose up -d open-webui
+    wait_healthy open-webui
+}
+
+# run_model_phase: no-rails sweep then rails sweep for the current model.
+# Args: outdir_base (e.g. results/dgx-spark-gb10/gemma4-nvfp4)
+run_model_phase() {
+    local base=$1
+
+    echo "[sweep] ── no-guardrails sweep → $base ──"
+    disable_guardrails
+    warmup
+    sweep "$base"
+
+    echo "[sweep] ── guardrails sweep → ${base}-rails ──"
+    enable_guardrails
+    warmup
+    sweep "${base}-rails"
+    disable_guardrails   # restore clean state for next model switch
+}
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+ensure_qdrant
+
+# ── Phase 0: Gemma-4-26B-A4B-NVFP4 ──────────────────────────────────────────
+
+if [[ "$PHASE" == "all" || "$PHASE" == "gemma4" ]]; then
+    echo "=== [$TARGET] Phase 0: Gemma-4-26B-A4B-NVFP4 ==="
+    switch_model \
+        "nvidia/Gemma-4-26B-A4B-NVFP4" \
+        "gemma4" \
+        "/vllm_plugins/noop.py" \
+        "gemma4" \
+        "0" \
+        "throughput" \
+        "$GEMMA4_MAX_LEN"
+    run_model_phase "results/$TARGET/gemma4-nvfp4"
+fi
+
+# ── Phase 1: Nemotron-3-Nano-30B-A3B-NVFP4 ───────────────────────────────────
 
 if [[ "$TARGET" != "l40s" ]] && [[ "$PHASE" == "all" || "$PHASE" == "nemotron" ]]; then
     echo "=== [$TARGET] Phase 1: Nemotron-3-Nano-30B-A3B-NVFP4 ==="
-    wait_healthy vllm
-    smoke_test
-    warmup
-    sweep "results/$TARGET/nemotron-nano"
+    switch_model \
+        "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4" \
+        "qwen3_coder" \
+        "/vllm_plugins/nano_v3_reasoning_parser.py" \
+        "nano_v3" \
+        "1" \
+        "throughput" \
+        "$NEMOTRON_MAX_LEN"
+    run_model_phase "results/$TARGET/nemotron-nano"
 fi
 
-# ── Phase 2: Qwen3.5 ─────────────────────────────────────────────────────────
+# ── Phase 2: Qwen3.5-35B-A3B ─────────────────────────────────────────────────
 
 if [[ "$PHASE" == "all" || "$PHASE" == "qwen" ]]; then
     if [[ "$TARGET" == "l40s" ]]; then
         QWEN_MODEL="Qwen/Qwen3.5-35B-A3B-FP8"
-        QWEN_PARSER="qwen3"
+        QWEN_TCP="qwen3_coder"
         QWEN_FP4="0"
+        QWEN_FP4_BACKEND="throughput"
         QWEN_OUTDIR="results/$TARGET/qwen3.5-35b-fp8"
     else
-        QWEN_MODEL="AxionML/Qwen3.5-35B-A3B-NVFP4"
-        QWEN_PARSER="qwen3"
+        QWEN_MODEL="nvidia/Qwen3.6-35B-A3B-NVFP4"
+        QWEN_TCP="qwen3_coder"
         QWEN_FP4="1"
-        QWEN_OUTDIR="results/$TARGET/qwen3.5-35b-nvfp4"
+        QWEN_FP4_BACKEND="throughput"
+        QWEN_OUTDIR="results/$TARGET/qwen3.6-35b-nvfp4"
     fi
 
     echo "=== [$TARGET] Phase 2: $QWEN_MODEL ==="
-    if [[ "$TARGET" == "l40s" ]]; then
-        wait_healthy vllm  # l40s starts already configured for Qwen FP8
-        smoke_test
-        warmup
-    else
-        switch_model "$QWEN_MODEL" "/vllm_plugins/noop.py" "$QWEN_PARSER" "$QWEN_FP4" "$QWEN_MAX_LEN"
-    fi
-    sweep "$QWEN_OUTDIR"
+    switch_model \
+        "$QWEN_MODEL" \
+        "$QWEN_TCP" \
+        "/vllm_plugins/noop.py" \
+        "qwen3" \
+        "$QWEN_FP4" \
+        "$QWEN_FP4_BACKEND" \
+        "$QWEN_MAX_LEN"
+    run_model_phase "$QWEN_OUTDIR"
+fi
 
-    # ── Phase 3: restore Nemotron (non-l40s only) ─────────────────────────────
-    if [[ "$TARGET" != "l40s" ]]; then
-        echo "=== [$TARGET] Phase 3: restoring Nemotron ==="
-        switch_model \
-            "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4" \
-            "/vllm_plugins/nano_v3_reasoning_parser.py" \
-            "nano_v3" \
-            "1" \
-            "$NEMOTRON_MAX_LEN"
-    fi
+# ── Phase 3: restore Gemma-4 (default production model) ──────────────────────
+
+if [[ "$PHASE" == "all" ]] && [[ "$TARGET" != "l40s" ]]; then
+    echo "=== [$TARGET] Phase 3: restoring Gemma-4 ==="
+    switch_model \
+        "nvidia/Gemma-4-26B-A4B-NVFP4" \
+        "gemma4" \
+        "/vllm_plugins/noop.py" \
+        "gemma4" \
+        "0" \
+        "throughput" \
+        "$GEMMA4_MAX_LEN"
 fi
 
 echo "=== sweep complete ==="
