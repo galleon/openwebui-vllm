@@ -540,18 +540,34 @@ docker compose down -v
 
 `locustfile.py` benchmarks the OpenWebUI stack under concurrent load and captures streaming-specific metrics that plain HTTP benchmarkers miss.
 
+### Methodology
+
+vLLM's automatic prefix caching (APC) is **disabled** (`--no-enable-prefix-caching` in `docker-compose.yml`) for all benchmark runs. Combined with a per-request random hex suffix appended to every question in `locustfile.py`, this guarantees cold-cache conditions and prevents KV cache reuse from inflating TTFT or throughput figures. Results reflect worst-case, real-world first-request behaviour — which is what matters for capacity planning.
+
+> **Note on existing results:** benchmark data collected before this change (pre-July 2026) was gathered with APC enabled and only 8 questions in the pool — high collision probability at ≥50 concurrent users. Those TTFT figures should be treated as optimistic.
+
+### Task modes
+
+Four task variants give a full comparison matrix. Run all together or isolate with `-T`:
+
+| Tag | Tasks | Weight | Description |
+|---|---|---|---|
+| `nothink` | NT PLAIN, NT RAG | 1 : 3 | Thinking disabled — throughput ceiling |
+| `think` | PLAIN, RAG | 1 : 3 | Chain-of-thought enabled — quality ceiling |
+| *(default)* | all four | mixed | Combined run |
+
 ### Metrics
+
+Each metric appears as a separate row in the Locust stats table and CSV, prefixed by task type (`PLAIN`, `RAG`, `NT PLAIN`, `NT RAG`):
 
 | Metric | Description |
 |---|---|
 | **TTFT** | Time To First Token — from request send to first streamed token (ms) |
 | **ITL avg** | Average inter-token latency — smoothness of streaming (ms) |
-| **ITL p95** | 95th-percentile inter-token latency — tail jitter; high p95 vs avg indicates stalls (ms) |
-| **TPS** | Output throughput reported as ms-per-token — answer-length-neutral, lower is faster |
+| **ITL p95** | 95th-percentile inter-token latency — tail jitter; high p95/avg ratio indicates stalls |
+| **TPS** | ms-per-output-token — answer-length-neutral throughput, lower is faster |
 | **E2E** | Total end-to-end latency including RAG retrieval + full generation (ms) |
 | **RAG overhead** | `TTFT(RAG) − TTFT(PLAIN)` — isolates the pure cost of vector retrieval (ms) |
-
-Each metric appears as a separate row in the Locust stats table and CSV, for both `RAG` and `PLAIN` (no-KB) task prefixes.
 
 ### Setup
 
@@ -565,7 +581,7 @@ OPENWEBUI_KB_ID=<knowledge-base-uuid>
 OPENWEBUI_MODEL=nvidia/Gemma-4-26B-A4B-NVFP4
 ```
 
-Edit `bench_questions.json` to match your knowledge base content:
+Edit `bench_questions.json` to match your knowledge base content — more questions means lower collision probability at high concurrency:
 
 ```json
 ["Where can I buy a ticket?", "What time does the event start?"]
@@ -573,9 +589,12 @@ Edit `bench_questions.json` to match your knowledge base content:
 
 ### Get your Knowledge Base UUID
 
+Note the trailing slash — without it Open WebUI's router returns the HTML frontend instead of JSON. Also source `.env` first so the variable is available:
+
 ```bash
-curl -s http://localhost:3000/api/v1/knowledge \
-  -H "Authorization: Bearer $OPENWEBUI_API_KEY" | jq '.[].id'
+source .env
+curl -s http://localhost:3000/api/v1/knowledge/ \
+  -H "Authorization: Bearer $OPENWEBUI_API_KEY" | jq '.items[] | {name: .name, id: .id}'
 ```
 
 ### Run
@@ -584,22 +603,23 @@ curl -s http://localhost:3000/api/v1/knowledge \
 # Interactive web UI at http://localhost:8089
 ./locustfile.py --host http://localhost:3000
 
-# Headless — 10 concurrent users, ramp 2/s, 60 s, save CSV
+# Headless — 10 concurrent users, ramp 2/s, 5 min steady-state, save CSV
 ./locustfile.py --host http://localhost:3000 \
-  --headless -u 10 -r 2 --run-time 60s \
-  --csv=results/bench
+  --headless -u 10 -r 2 --run-time 360s --reset-stats \
+  --csv=results/dgx-spark-gb10/nemotron-nano/nothink_u10 -T nothink
+
+# Run think mode in isolation
+./locustfile.py --host http://localhost:3000 \
+  --headless -u 10 -r 2 --run-time 360s --reset-stats \
+  --csv=results/dgx-spark-gb10/nemotron-nano/think_u10 -T think
 ```
 
 ### Interpreting results
 
-Key comparisons:
 - **RAG overhead avg** — pure retrieval cost; should stay below ~500 ms for a good UX
 - **ITL p95 / ITL avg ratio** — values above ~3× indicate bursty generation (VRAM pressure, GC)
-- **TPS PLAIN vs RAG** — should be similar; a large gap suggests the RAG context is exceeding the model's optimal context window
-
-### Task weights
-
-The locustfile runs RAG queries at 3× the rate of plain queries. Adjust the `@task` weights at the bottom of the file to change the mix.
+- **TPS PLAIN vs RAG** — should be similar; a large gap suggests RAG context is pushing the model past its optimal window
+- **Nothink vs think throughput ratio** — typically 2–4× on MoE models; measures reasoning overhead at your concurrency level
 
 ---
 
